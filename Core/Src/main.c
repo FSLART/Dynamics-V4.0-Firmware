@@ -194,20 +194,20 @@ int main(void)
     ADC_UpdateMovingAverage();
 
     // ADC VARIABLES
-    uint16_t adcST_Angle = adc_filtered[0]; // Steering Angle (Only Dynamics Front) - Filtrado
-    // uint16_t adcBRK_PRESS=adc_filtered[1]; //Brake Pressure (Only Dynamics Rear) - Filtrado
+    //uint16_t adcST_Angle = adc_filtered[0]; // Steering Angle (Only Dynamics Front) - Filtrado
+    uint16_t adcBRK_PRESS=adc_filtered[1]; //Brake Pressure (Only Dynamics Rear) - Filtrado
     uint16_t adcSuspL = adc_filtered[2]; // Suspension Left - Filtrado
     uint16_t adcSuspR = adc_filtered[3]; // Suspension Right - Filtrado
 
     // Steering Angle
-    float ST_ANGLE;
+    /*float ST_ANGLE;
     float inclive = 270.0f / 3072.0f;
-    ST_ANGLE = (inclive * adcST_Angle) - 180.0;
+    ST_ANGLE = (inclive * adcST_Angle) - 180.0;*/
     // End Steering Angle
 
     // Brake Pressure
-    /*float BRK_PRESS;
-    BRK_PRESS= MeasureBrakePressure(adcBRK_PRESS);*/
+    float BRK_PRESS;
+    BRK_PRESS= MeasureBrakePressure(adcBRK_PRESS);
     // End Brake Pressure
 
     // Suspension Right
@@ -242,17 +242,17 @@ int main(void)
     {
       last_can_send = now;
 
-      int16_t angle = (int16_t)(ST_ANGLE * 10);
+      int16_t brake = (int16_t)(BRK_PRESS * 10);
       int16_t susp_r = (int16_t)(SUSP_R * 10);
       int16_t susp_l = (int16_t)(SUSP_L * 10);
 
       TxHeader.IDE = CAN_ID_STD;
-      TxHeader.StdId = 0x446; // Confirmar
+      TxHeader.StdId = 0x456; // Confirmar
       TxHeader.RTR = CAN_RTR_DATA;
       TxHeader.DLC = 6;
 
-      TxData[0] = angle & 0xFF;        // Least significant byte first
-      TxData[1] = (angle >> 8) & 0xFF; // Most significant byte
+      TxData[0] = brake & 0xFF;        // Least significant byte first
+      TxData[1] = (brake >> 8) & 0xFF; // Most significant byte
       TxData[2] = susp_r & 0xFF;
       TxData[3] = (susp_r >> 8) & 0xFF;
       TxData[4] = susp_l & 0xFF;
@@ -270,8 +270,8 @@ int main(void)
     // Termina aqui a parte de CAN
 
     // Bluetooth messages
-    printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
-    // printf("Pressure Brake %.2f bar  ADC: %u \n", BRK_PRESS, adcBRK_PRESS);
+    //printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
+    printf("Pressure Brake %.2f bar  ADC: %u \n", BRK_PRESS, adcBRK_PRESS);
     printf("Suspension Right: %.2fmm ADC: %u \n", SUSP_R, adcSuspR);
     printf("Suspension Left: %.2fmm ADC: %u \n", SUSP_L, adcSuspL);
 
@@ -758,7 +758,7 @@ float MeasureBrakePressure(uint16_t bits)
   }
 
   // Limit maximum pressure if needed
-  const float MAX_PRESSURE = 100.0f; // Maximum measurable pressure
+  const float MAX_PRESSURE = 140.0f; // Maximum measurable pressure
   if (pressure > MAX_PRESSURE)
   {
     pressure = MAX_PRESSURE;
@@ -909,9 +909,9 @@ void CAN_FilterConfig1()
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
   canfilterconfig.FilterBank = 0; // which filter bank to use from the assigned ones
   canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x446 << 5;
+  canfilterconfig.FilterIdHigh = 0x456 << 5;
   canfilterconfig.FilterIdLow = 0;
-  canfilterconfig.FilterMaskIdHigh = 0x446 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x456 << 5;
   canfilterconfig.FilterMaskIdLow = 0x0000;
   canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
@@ -926,9 +926,9 @@ void CAN_FilterConfig2()
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
   canfilterconfig.FilterBank = 18; // which filter bank to use from the assigned ones
   canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x446 << 5;
+  canfilterconfig.FilterIdHigh = 0x456 << 5;
   canfilterconfig.FilterIdLow = 0;
-  canfilterconfig.FilterMaskIdHigh = 0x446 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x456 << 5;
   canfilterconfig.FilterMaskIdLow = 0x0000;
   canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
