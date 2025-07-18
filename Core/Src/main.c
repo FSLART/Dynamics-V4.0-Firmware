@@ -21,13 +21,24 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+
+// Dynamics Front or Dynamics Rear?
+
+#define DYNAMICS_FRONT
+//#define DYNAMICS_REAR
+
+/************************************************************************/
+
 #include <stdio.h>
 #include <math.h>
 
-#define TIMER_FREQ 1000000.0f  // 1 MHz após prescaler de 71
-#define Timer_Period (1.0f/TIMER_FREQ)  // 1μs
+#define TIMER_FREQ 62937.0f              // 72MHz/(1143+1) = 62.937 kHz
+#define Timer_Period (1.0f / TIMER_FREQ) // 1μs
 #define MAX_Speed_Measures 10
-#define MAX_TIME_CAPTURE 5000 // Protection for Stoped Car
+
+#define MAX_VALID_PERIOD 65534           // Máximo período válido do timer
+
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,40 +71,50 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 // Global Variables
 uint32_t blink_time = 100, previus_blink = 0;
-uint16_t ADC_VALUE[4];    // Array for ADC values~
-uint32_t speed_capture_L; // Captured value of speed of left wheel
-uint32_t speed_capture_R; // Captured value of speed of right wheel
+uint16_t ADC_VALUE[4];                       // Array for ADC values
+uint32_t time_capture_L;                     // Captured value of speed of left wheel
+uint32_t time_capture_R;                     // Captured value of speed of right wheel
 
-// Variáveis para controle de captura alternada
+// Variables for alternated capture control
 volatile uint8_t captureState_L = 0, captureState_R = 0;
 volatile uint32_t lowPeriod_L = 0, lowPeriod_R = 0;
 
-// Moving Average for ADC
-#define ADC_BUFFER_SIZE 20                // Tamanho do buffer para média móvel
-uint16_t adc_buffers[4][ADC_BUFFER_SIZE]; // Buffer para cada canal ADC
-uint8_t adc_buffer_index = 0;             // Índice circular do buffer
-uint16_t adc_filtered[4];                 // Valores filtrados por média móvel
+volatile uint32_t last_capture_time_L = 0;   // Last capture timestamp for left wheel
+volatile uint32_t last_capture_time_R = 0;   // Last capture timestamp for right wheel
+const uint32_t WHEEL_TIMEOUT_MS = 500;      // Wheel timeout in milliseconds
+// Moving Average for ADC 
+#define ADC_BUFFER_SIZE 50                   // Buffer size for moving average
+uint16_t adc_buffers[4][ADC_BUFFER_SIZE];    // Buffer for each ADC channel
+uint8_t adc_buffer_index = 0;               // Circular buffer index
+uint16_t adc_filtered[4];                   // Filtered values by moving average
 
 // Capture
-uint32_t speed_measures_left[MAX_Speed_Measures];  // Vector to store values whitout filter
-uint32_t speed_measures_right[MAX_Speed_Measures]; // Vector to store values whitout filter
-uint32_t posL = 0, posR = 0;                       // Circular Index of the array
+uint32_t speed_measures_left[MAX_Speed_Measures];  // Vector to store values without filter
+uint32_t speed_measures_right[MAX_Speed_Measures]; // Vector to store values without filter
+uint32_t posL = 0, posR = 0;                       // Circular index of the array
 volatile uint32_t last_captured_pulseL, last_captured_pulseR;
 
 // CAN
-uint32_t can_send_interval = 50; // ms
-uint32_t last_can_send = 0;
+uint32_t can_send_interval = 50;                    // CAN send interval in milliseconds
+uint32_t last_can_send = 0;                        // Last CAN send timestamp
 
 CAN_TxHeaderTypeDef TxHeader;
 uint8_t TxData[8];
 uint32_t TxMailbox;
 
 // Functions
+float MeasureSteeringAngle(uint16_t);
 float MeasureBrakePressure(uint16_t);
 float MeasureSuspensionPosition(uint16_t);
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim); // Input Capture Callback
-float calculate_speed_wheel(capture);
-void ADC_UpdateMovingAverage(void); // Função para atualizar média móvel do ADC
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim);  // Input Capture Callback
+void Speed_Measures(void);
+float Calculate_Speed_in_Wheel(float,uint32_t);           // Calculate Speed in Wheel
+void ADC_UpdateMovingAverage(void);                       // Function to update ADC moving average
+float Moving_Average_Filter_Right(void);
+float Moving_Average_Filter_Left(void);
+void CAN_FilterConfig1(void);
+void CAN_FilterConfig2(void); 
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -156,12 +177,12 @@ int main(void)
   MX_TIM14_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_ADC_Start_DMA(&hadc1, ADC_VALUE, 4); // READ ADC VALUES TO DMA
+  HAL_ADC_Start_DMA(&hadc1, ADC_VALUE, 4);    // Start ADC DMA for reading values
   // Start Timer Interruptions for Input Captures
   HAL_TIM_IC_Start_IT(&htim13, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim14, TIM_CHANNEL_1);
 
-  // Inicializar buffers para média móvel com zeros
+  // Initialize moving average buffers with zeros
   for (int i = 0; i < 4; i++)
   {
     for (int j = 0; j < ADC_BUFFER_SIZE; j++)
@@ -190,24 +211,31 @@ int main(void)
     }
     // LED HEARTBEAT END
 
-    // Atualizar médias móveis dos ADCs
+    // Update ADC moving averages
     ADC_UpdateMovingAverage();
 
-    // ADC VARIABLES
-    //uint16_t adcST_Angle = adc_filtered[0]; // Steering Angle (Only Dynamics Front) - Filtrado
-    uint16_t adcBRK_PRESS=adc_filtered[1]; //Brake Pressure (Only Dynamics Rear) - Filtrado
-    uint16_t adcSuspL = adc_filtered[2]; // Suspension Left - Filtrado
-    uint16_t adcSuspR = adc_filtered[3]; // Suspension Right - Filtrado
+// ADC VARIABLES
+#ifdef DYNAMICS_FRONT
+    uint16_t adcST_Angle = adc_filtered[0];         // Steering Angle (Only Dynamics Front) - Filtered
+#endif
+#ifdef DYNAMICS_REAR
+    uint16_t adcBRK_PRESS = adc_filtered[1];        // Brake Pressure (Only Dynamics Rear) - Filtered
+#endif
+    uint16_t adcSuspL = adc_filtered[2];            // Suspension Left - Filtered
+    uint16_t adcSuspR = adc_filtered[3];            // Suspension Right - Filtered
 
-    // Steering Angle
-    /*float ST_ANGLE;
-    float inclive = 270.0f / 3072.0f;
-    ST_ANGLE = (inclive * adcST_Angle) - 180.0;*/
-    // End Steering Angle
+// Steering Angle
+#ifdef DYNAMICS_FRONT
+    float ST_ANGLE;
+    ST_ANGLE=MeasureSteeringAngle(adcST_Angle);
+#endif
+// End Steering Angle
 
-    // Brake Pressure
+// Brake Pressure
+#ifdef DYNAMICS_REAR
     float BRK_PRESS;
-    BRK_PRESS= MeasureBrakePressure(adcBRK_PRESS);
+    BRK_PRESS = MeasureBrakePressure(adcBRK_PRESS);
+#endif
     // End Brake Pressure
 
     // Suspension Right
@@ -220,39 +248,41 @@ int main(void)
     SUSP_L = MeasureSuspensionPosition(adcSuspL);
     // End Suspension Left
 
-    // Começa aqui os INPUT CAPTURES
-    /*float filtered_time_left, filtered_time_right;
+    // Input Capture processing starts here
+    float filtered_time_left, filtered_time_right;
+    float speed_km_left, speed_km_right;
     Speed_Measures();
     filtered_time_left = Moving_Average_Filter_Left();
     filtered_time_right = Moving_Average_Filter_Right();
-    if (last_captured_pulseL > MAX_TIME_CAPTURE)
-    {
-      int a = 0;
-    }
-    if (last_captured_pulseR > MAX_TIME_CAPTURE)
-    {
-      int B = 0;
-    }*/
-    // Termina aqui os INPUT CAPTURES
+    float time_R = filtered_time_right * Timer_Period;
+    float time_L = filtered_time_left * Timer_Period;
+    speed_km_left = Calculate_Speed_in_Wheel(time_L, last_capture_time_L);
+    speed_km_right = Calculate_Speed_in_Wheel(time_R, last_capture_time_R);
+    if (speed_km_left < 0.1f) speed_km_left = 0.0f;
+    if (speed_km_right < 0.1f) speed_km_right = 0.0f;
 
-    // Começa aqui a parte de CAN
+// Input Capture processing ends here
 
+// CAN communication starts here
+#ifdef DYNAMICS_FRONT
     uint32_t now = HAL_GetTick();
     if ((now - last_can_send) >= can_send_interval)
     {
       last_can_send = now;
 
-      int16_t brake = (int16_t)(BRK_PRESS * 10);
-      int16_t susp_r = (int16_t)(SUSP_R * 10);
-      int16_t susp_l = (int16_t)(SUSP_L * 10);
+      int16_t angle = (int16_t)(ST_ANGLE * 10);
+      uint16_t susp_r = (uint16_t)(SUSP_R * 10);
+      uint16_t susp_l = (uint16_t)(SUSP_L * 10);
+      uint16_t spd_left = (uint16_t)(speed_km_left * 10);
+      uint16_t spd_right = (uint16_t)(speed_km_right * 10);
 
       TxHeader.IDE = CAN_ID_STD;
-      TxHeader.StdId = 0x456; // Confirmar
+      TxHeader.StdId = 0x446;                       // Confirm ID
       TxHeader.RTR = CAN_RTR_DATA;
       TxHeader.DLC = 6;
 
-      TxData[0] = brake & 0xFF;        // Least significant byte first
-      TxData[1] = (brake >> 8) & 0xFF; // Most significant byte
+      TxData[0] = angle & 0xFF;                     // Least significant byte first
+      TxData[1] = (angle >> 8) & 0xFF;              // Most significant byte
       TxData[2] = susp_r & 0xFF;
       TxData[3] = (susp_r >> 8) & 0xFF;
       TxData[4] = susp_l & 0xFF;
@@ -266,35 +296,98 @@ int main(void)
       {
         Error_Handler();
       }
-    }
-    // Termina aqui a parte de CAN
 
-    // Bluetooth messages
-    //printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
+      TxHeader.StdId = 0x456;
+      TxHeader.DLC = 4;
+
+      TxData[0] = spd_left & 0xFF;
+      TxData[1] = (spd_left >> 8) & 0xFF;
+      TxData[2] = spd_right & 0xFF;
+      TxData[3] = (spd_right >> 8) & 0xFF;
+
+      if (HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+      if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+    }
+
+#endif
+
+#ifdef DYNAMICS_REAR
+    uint32_t now = HAL_GetTick();
+    if ((now - last_can_send) >= can_send_interval)
+    {
+      last_can_send = now;
+
+      uint16_t brake = (uint16_t)(BRK_PRESS * 10);
+      uint16_t susp_r = (uint16_t)(SUSP_R * 10);
+      uint16_t susp_l = (uint16_t)(SUSP_L * 10);
+      uint16_t spd_left = (uint16_t)(speed_km_left * 10);
+      uint16_t spd_right = (uint16_t)(speed_km_right * 10);
+
+      TxHeader.IDE = CAN_ID_STD;
+      TxHeader.StdId = 0x546;                       // Confirm ID
+      TxHeader.RTR = CAN_RTR_DATA;
+      TxHeader.DLC = 6;
+
+      TxData[0] = brake & 0xFF;                     // Least significant byte first
+      TxData[1] = (brake >> 8) & 0xFF;              // Most significant byte
+      TxData[2] = susp_r & 0xFF;
+      TxData[3] = (susp_r >> 8) & 0xFF;
+      TxData[4] = susp_l & 0xFF;
+      TxData[5] = (susp_l >> 8) & 0xFF;
+
+      if (HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+      if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+
+      TxHeader.StdId = 0x556;
+      TxHeader.DLC = 4;
+
+      TxData[0] = spd_left & 0xFF;
+      TxData[1] = (spd_left >> 8) & 0xFF;
+      TxData[2] = spd_right & 0xFF;
+      TxData[3] = (spd_right >> 8) & 0xFF;
+
+      if (HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+      if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+      {
+        Error_Handler();
+      }
+    }
+
+#endif
+// CAN communication ends here
+
+// Bluetooth messages
+#ifdef DYNAMICS_FRONT
+    printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
+#endif
+#ifdef DYNAMICS_REAR
     printf("Pressure Brake %.2f bar  ADC: %u \n", BRK_PRESS, adcBRK_PRESS);
+#endif
     printf("Suspension Right: %.2fmm ADC: %u \n", SUSP_R, adcSuspR);
     printf("Suspension Left: %.2fmm ADC: %u \n", SUSP_L, adcSuspL);
+    printf("Perdu é gay\n");
+
+    printf("Right period: %.6f s (%lu ticks)\n", time_R, time_capture_R);
+    printf("Left period: %.6f s (%lu ticks)\n", time_L, time_capture_L);
+    printf("Left wheel speed is %.2f km/h\n",speed_km_left);
+    printf("Right wheel speed is %.2f km/h\n",speed_km_right);
 
     // Bluetooth messages end
-
-    // debug capture
-    float tempo_real_D = speed_capture_R * (Timer_Period);
-    float tempo_real_L = speed_capture_L * (Timer_Period);
-
-    // Valores do período em nível baixo (quando o sinal está em 0)
-    printf("Período em nível baixo direita: %.6f s (%lu ticks)\n", tempo_real_D, speed_capture_R);
-    printf("Período em nível baixo esquerda: %.6f s (%lu ticks)\n", tempo_real_L, speed_capture_L);
-    
-    // Calcular frequência (2 * período do nível baixo para 50% duty cycle)
-    if (tempo_real_D > 0) {
-      float freq_D = 1.0f / (tempo_real_D * 2.0f);  // Para duty cycle de 50%
-      printf("Frequência roda direita: %.2f Hz\n", freq_D);
-    }
-    
-    if (tempo_real_L > 0) {
-      float freq_L = 1.0f / (tempo_real_L * 2.0f);  // Para duty cycle de 50%
-      printf("Frequência roda esquerda: %.2f Hz\n", freq_L);
-    }
   }
   /* USER CODE END 3 */
 }
@@ -524,7 +617,7 @@ static void MX_TIM13_Init(void)
 
   /* USER CODE END TIM13_Init 1 */
   htim13.Instance = TIM13;
-  htim13.Init.Prescaler = 71;
+  htim13.Init.Prescaler = 1143;
   htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim13.Init.Period = 65535;
   htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -569,7 +662,7 @@ static void MX_TIM14_Init(void)
 
   /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
-  htim14.Init.Prescaler = 71;
+  htim14.Init.Prescaler = 1143;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 65535;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -719,6 +812,30 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+float MeasureSteeringAngle(uint16_t bits)
+{
+// Constants and variables
+  const float ADC_MAX = 4095.0f;
+  const float MCU_VREF = 3.3f;                    // MCU reference voltage
+  const float SENSOR_VREF_Max = 4.5f;
+  const float SENSOR_VREF_Min = 0.5f;             // Sensor reference voltage
+  const float Resolution = 180.0f;                // Resolution of sensor -180 to 180
+  const float OFFSET = -31.3f;                    // In case of mechanical problems, put offset angle
+  
+  // Calculate Function Slope
+  float max_v = SENSOR_VREF_Max * (2.0f/3.0f);
+  float min_v = SENSOR_VREF_Min * (2.0f/3.0f);
+  float inclination = 360.0f / (max_v - min_v);
+  
+  // Calculate Steering Angle
+  float V_STA = (MCU_VREF * bits) / ADC_MAX;
+  float ST_Angle = inclination * V_STA - 45 - Resolution;
+
+  // If necessary add OFFSET
+  ST_Angle += OFFSET;
+  return ST_Angle;
+}
+
 float MeasureBrakePressure(uint16_t bits)
 {
   // Constants for clarity
@@ -770,101 +887,157 @@ float MeasureBrakePressure(uint16_t bits)
 float MeasureSuspensionPosition(uint16_t bits)
 {
   // Constants and Variables
-  float V_SUSP;                // Voltage Signal from sensor
-  float sensor_voltage = 5;    // MAX Voltage level from sensor
-  float MCU_voltage = 3.3;     // MAX MCU voltage level
-  float Eletrical_stroke = 75; // mm
-  float SUSPENSION_POSITION;   // Suspension level in mm
+  float V_SUSP;                                    // Voltage Signal from sensor
+  float sensor_voltage = 5;                       // MAX Voltage level from sensor
+  float MCU_voltage = 3.3;                        // MAX MCU voltage level
+  float Electrical_stroke = 75;                   // mm
+  float SUSPENSION_POSITION;                      // Suspension level in mm
   float Conversion_Factor = MCU_voltage / sensor_voltage;
-  float volts; // converted voltage
+  float volts;                                    // converted voltage
   // Calculate Voltage from ADC
-  V_SUSP = (3.3 * bits) / 4096;
+  V_SUSP = (MCU_voltage * bits) / 4095;
   volts = V_SUSP / Conversion_Factor;
   // Calculate Position
-  SUSPENSION_POSITION = (Eletrical_stroke * volts) / sensor_voltage;
+  SUSPENSION_POSITION = (Electrical_stroke * volts) / sensor_voltage;
 
-  return SUSPENSION_POSITION; // return suspension level in millimeters
+  return SUSPENSION_POSITION;                     // return suspension level in millimeters
 }
 
 /**
- * @brief  Atualiza a média móvel para todos os canais ADC
+ * @brief  Updates the moving average for all ADC channels
  * @retval None
  */
 void ADC_UpdateMovingAverage(void)
 {
-  // Para cada canal ADC
+  // For each ADC channel
   for (int channel = 0; channel < 4; channel++)
   {
-    // Adiciona o novo valor ao buffer circular
+    // Add the new value to the circular buffer
     adc_buffers[channel][adc_buffer_index] = ADC_VALUE[channel];
 
-    // Calcular soma de todos os valores no buffer
+    // Calculate sum of all values in the buffer
     uint32_t sum = 0;
     for (int i = 0; i < ADC_BUFFER_SIZE; i++)
     {
       sum += adc_buffers[channel][i];
     }
 
-    // Calcular média e atualizar o valor filtrado
+    // Calculate average and update the filtered value
     adc_filtered[channel] = (uint16_t)(sum / ADC_BUFFER_SIZE);
   }
 
-  // Atualiza o índice circular
+  // Update circular index
   adc_buffer_index = (adc_buffer_index + 1) % ADC_BUFFER_SIZE;
 }
 
+/**
+ * @brief  Timer Input Capture Callback - Handles wheel speed sensor pulses
+ * @param  htim: Timer handle that triggered the interrupt
+ * @note   This function processes falling edge pulses from wheel speed sensors
+ *         TIM13 - Left wheel speed sensor (Hall sensor or encoder)
+ *         TIM14 - Right wheel speed sensor (Hall sensor or encoder)
+ * @retval None
+ */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
+  static uint32_t lastCapture_L = 0;               // Previous capture value for left wheel
+  static uint32_t lastCapture_R = 0;               // Previous capture value for right wheel
+  static uint8_t firstCapture_L = 1;               // Flag for first capture on left wheel
+  static uint8_t firstCapture_R = 1;               // Flag for first capture on right wheel
+
+  // Left wheel speed sensor processing (TIM13)
   if (htim->Instance == TIM13 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-    if (captureState_L == 0) // Acabamos de detectar borda de descida (1→0)
+    uint32_t currentCapture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+    uint32_t calculated_period;
+    
+    // Update timestamp for timeout detection
+    last_capture_time_L = HAL_GetTick();
+
+    // Handle first capture - just store the value for reference
+    if (firstCapture_L)
     {
-      // Resetamos o contador para começar a medir o tempo em nível baixo
-      __HAL_TIM_SET_COUNTER(htim, 0);
-      
-      // Configuramos para detectar a próxima borda de subida (0→1)
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
-      captureState_L = 1;
+      lastCapture_L = currentCapture;
+      firstCapture_L = 0;
+      time_capture_L = 0;                          // No valid period yet
     }
-    else // Acabamos de detectar borda de subida (0→1)
+    else
     {
-      // Capturamos o tempo que o sinal ficou em nível baixo
-      speed_capture_L = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-      lowPeriod_L = speed_capture_L; // Guardamos para usar depois
-      
-      // Configuramos para detectar a próxima borda de descida (1→0)
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
-      captureState_L = 0;
+      // Calculate period between consecutive pulses
+      // Handle timer overflow case (16-bit timer with 65535 max value)
+      if (currentCapture >= lastCapture_L)
+      {
+        calculated_period = currentCapture - lastCapture_L;
+      }
+      else
+      {
+        // Timer overflow occurred
+        calculated_period = (65535 - lastCapture_L) + currentCapture + 1;
+      }
+
+      // Validate period is within acceptable range
+      if (calculated_period > 0 && calculated_period <= MAX_VALID_PERIOD)
+      {
+        time_capture_L = calculated_period;        // Store valid period
+      }
+      else
+      {
+        time_capture_L = 0;                        // Invalid period, likely noise
+      }
+
+      lastCapture_L = currentCapture;              // Update reference for next capture
     }
   }
+
+  // Right wheel speed sensor processing (TIM14)
   else if (htim->Instance == TIM14 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-    if (captureState_R == 0) // Acabamos de detectar borda de descida (1→0)
+    uint32_t currentCapture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+    uint32_t calculated_period;
+    
+    // Update timestamp for timeout detection
+    last_capture_time_R = HAL_GetTick();
+
+    // Handle first capture - just store the value for reference
+    if (firstCapture_R)
     {
-      // Resetamos o contador para começar a medir o tempo em nível baixo
-      __HAL_TIM_SET_COUNTER(htim, 0);
-      
-      // Configuramos para detectar a próxima borda de subida (0→1)
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
-      captureState_R = 1;
+      lastCapture_R = currentCapture;
+      firstCapture_R = 0;
+      time_capture_R = 0;                          // No valid period yet
     }
-    else // Acabamos de detectar borda de subida (0→1)
+    else
     {
-      // Capturamos o tempo que o sinal ficou em nível baixo
-      speed_capture_R = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-      lowPeriod_R = speed_capture_R; // Guardamos para usar depois
+      // Calculate period between consecutive pulses
+      // Handle timer overflow case (16-bit timer with 65535 max value)
+      if (currentCapture >= lastCapture_R)
+      {
+        calculated_period = currentCapture - lastCapture_R;
+      }
+      else
+      {
+        // Timer overflow occurred
+        calculated_period = (65535 - lastCapture_R) + currentCapture + 1;
+      }
+
+      // Validate period is within acceptable range
+      if (calculated_period > 0 && calculated_period <= MAX_VALID_PERIOD)
+      {
+        time_capture_R = calculated_period;        // Store valid period
+      }
+      else
+      {
+        time_capture_R = 0;                        // Invalid period, likely noise
+      }
       
-      // Configuramos para detectar a próxima borda de descida (1→0)
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
-      captureState_R = 0;
+      lastCapture_R = currentCapture;              // Update reference for next capture
     }
   }
 }
-/*
+
 void HAL_SYSTICK_CALLBACK()
 {
-  last_captured_pulseL++; // Increments 1ms
-  last_captured_pulseR++; // Increments 1ms
+  last_captured_pulseL++;                         // Increments 1ms
+  last_captured_pulseR++;                         // Increments 1ms
 }
 void Speed_Measures()
 {
@@ -873,7 +1046,7 @@ void Speed_Measures()
   posL = (posL + 1) % MAX_Speed_Measures;
   posR = (posR + 1) % MAX_Speed_Measures;
 }
-float Moving_Average_Filter_Left()
+float Moving_Average_Filter_Left(void)
 {
   uint32_t sum = 0;
   float filtered_speed_left;
@@ -884,7 +1057,7 @@ float Moving_Average_Filter_Left()
   filtered_speed_left = sum / MAX_Speed_Measures;
   return filtered_speed_left;
 }
-float Moving_Average_Filter_Right()
+float Moving_Average_Filter_Right(void)
 {
   uint32_t sum = 0;
   float filtered_speed_right;
@@ -895,45 +1068,135 @@ float Moving_Average_Filter_Right()
   filtered_speed_right = sum / MAX_Speed_Measures;
   return filtered_speed_right;
 }
-float Calculate_Speed_in_Wheel()
+float Calculate_Speed_in_Wheel(float time, uint32_t last_capture_time)
 {
-}
-float calculate_speed_wheel(capture){
+  // Constants and Variables
+  const int teeth = 36;                            // Number of teeth in CogWheel
+  const float inches_diameter = 20.5;              // Diameter of Wheels in inches
+  const float diameter = 25.4 * inches_diameter;   // Diameter of Wheels in mm
+  const float perimeter = diameter * 3.141592;     // Perimeter of wheel in mm
+  const float perimeter_m = perimeter / 1000.0f;   // Perimeter in Meters
+  
+  uint32_t current_time = HAL_GetTick();
+  if ((current_time - last_capture_time) > WHEEL_TIMEOUT_MS)
+  {
+    return 0.0f;                                   // Wheel stopped by timeout
+  }
 
-}*/
+   if (time <= 0)
+  {
+    return 0.0f;                                   // Stopped Wheel
+  }
+  
+  // Calculate Frequency
+  float frequency = 1.0f / time;                   // Hz
+
+  // Calculate Wheel RPM
+  float wheel_rpm = (frequency * 60) / teeth;
+
+  // Calculate Speed
+  float speed_km_per_hour = (perimeter_m * wheel_rpm) * 0.06;
+
+  return speed_km_per_hour;                        // Return value of Speed in Km/h
+}
 
 void CAN_FilterConfig1()
 {
+#ifdef DYNAMICS_FRONT
   CAN_FilterTypeDef canfilterconfig;
 
+  // Filter for 0x446
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
-  canfilterconfig.FilterBank = 0; // which filter bank to use from the assigned ones
+  canfilterconfig.FilterBank = 0;                  // which filter bank to use from the assigned ones
   canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x456 << 5;
+  canfilterconfig.FilterIdHigh = 0x446 << 5;
   canfilterconfig.FilterIdLow = 0;
-  canfilterconfig.FilterMaskIdHigh = 0x456 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x446 << 5;
   canfilterconfig.FilterMaskIdLow = 0x0000;
   canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
-  canfilterconfig.SlaveStartFilterBank = 18; // how many filters to assign to the CAN1 (master can)
+  canfilterconfig.SlaveStartFilterBank = 18;       // how many filters to assign to the CAN1 (master can)
 
   HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig);
+  
+  // Filter for 0x456
+   canfilterconfig.FilterBank = 1;
+  canfilterconfig.FilterIdHigh = 0x456 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x7FF << 5;
+  HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig);
+  
+#endif
+
+#ifdef DYNAMICS_REAR
+  CAN_FilterTypeDef canfilterconfig;
+
+  // Filter for 0x546
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 0;                  // which filter bank to use from the assigned ones
+  canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  canfilterconfig.FilterIdHigh = 0x546 << 5;
+  canfilterconfig.FilterIdLow = 0;
+  canfilterconfig.FilterMaskIdHigh = 0x546 << 5;
+  canfilterconfig.FilterMaskIdLow = 0x0000;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canfilterconfig.SlaveStartFilterBank = 18;       // how many filters to assign to the CAN1 (master can)
+
+  HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig);
+
+  // Filter for 0x556
+   canfilterconfig.FilterBank = 1;
+  canfilterconfig.FilterIdHigh = 0x556 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x7FF << 5;
+  HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig);
+#endif
 }
 void CAN_FilterConfig2()
 {
+#ifdef DYNAMICS_FRONT
   CAN_FilterTypeDef canfilterconfig;
 
+  // Filter for 0x446
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
-  canfilterconfig.FilterBank = 18; // which filter bank to use from the assigned ones
+  canfilterconfig.FilterBank = 18;                 // which filter bank to use from the assigned ones
   canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  canfilterconfig.FilterIdHigh = 0x456 << 5;
+  canfilterconfig.FilterIdHigh = 0x446 << 5;
   canfilterconfig.FilterIdLow = 0;
-  canfilterconfig.FilterMaskIdHigh = 0x456 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x446 << 5;
   canfilterconfig.FilterMaskIdLow = 0x0000;
   canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
 
   HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig);
+
+  // Filter for 0x456
+  canfilterconfig.FilterBank = 19;                 // Different bank for CAN2
+  canfilterconfig.FilterIdHigh = 0x456 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x7FF << 5;
+  HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig);
+#endif
+#ifdef DYNAMICS_REAR
+  CAN_FilterTypeDef canfilterconfig;
+
+  // Filter for 0x546
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 18;                 // which filter bank to use from the assigned ones
+  canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  canfilterconfig.FilterIdHigh = 0x546 << 5;
+  canfilterconfig.FilterIdLow = 0;
+  canfilterconfig.FilterMaskIdHigh = 0x546 << 5;
+  canfilterconfig.FilterMaskIdLow = 0x0000;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+
+  HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig);
+
+  // Filter for 0x556
+  canfilterconfig.FilterBank = 19;
+  canfilterconfig.FilterIdHigh = 0x556 << 5;
+  canfilterconfig.FilterMaskIdHigh = 0x7FF << 5;
+  HAL_CAN_ConfigFilter(&hcan2, &canfilterconfig);
+#endif
 }
 /* USER CODE END 4 */
 
