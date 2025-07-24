@@ -92,7 +92,6 @@ uint16_t adc_filtered[4];                   // Filtered values by moving average
 uint32_t speed_measures_left[MAX_Speed_Measures];  // Vector to store values without filter
 uint32_t speed_measures_right[MAX_Speed_Measures]; // Vector to store values without filter
 uint32_t posL = 0, posR = 0;                       // Circular index of the array
-volatile uint32_t last_captured_pulseL, last_captured_pulseR;
 
 // CAN
 uint32_t can_send_interval = 50;                    // CAN send interval in milliseconds
@@ -177,6 +176,10 @@ int main(void)
   MX_TIM14_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  for (int i = 0; i < MAX_Speed_Measures; i++) {
+    speed_measures_left[i] = 0;
+    speed_measures_right[i] = 0;
+  }
   HAL_ADC_Start_DMA(&hadc1, ADC_VALUE, 4);    // Start ADC DMA for reading values
   // Start Timer Interruptions for Input Captures
   HAL_TIM_IC_Start_IT(&htim13, TIM_CHANNEL_1);
@@ -372,20 +375,22 @@ int main(void)
 // CAN communication ends here
 
 // Bluetooth messages
-#ifdef DYNAMICS_FRONT
-    printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
-#endif
-#ifdef DYNAMICS_REAR
-    printf("Pressure Brake %.2f bar  ADC: %u \n", BRK_PRESS, adcBRK_PRESS);
-#endif
-    printf("Suspension Right: %.2fmm ADC: %u \n", SUSP_R, adcSuspR);
-    printf("Suspension Left: %.2fmm ADC: %u \n", SUSP_L, adcSuspL);
-    printf("Perdu é gay\n");
+static uint32_t last_debug_time = 0;
+uint32_t current_debug_time = HAL_GetTick();
 
-    printf("Right period: %.6f s (%lu ticks)\n", time_R, time_capture_R);
-    printf("Left period: %.6f s (%lu ticks)\n", time_L, time_capture_L);
-    printf("Left wheel speed is %.2f km/h\n",speed_km_left);
-    printf("Right wheel speed is %.2f km/h\n",speed_km_right);
+// Imprimir apenas a cada 500ms
+if ((current_debug_time - last_debug_time) >= 500) {
+    last_debug_time = current_debug_time;
+    
+    #ifdef DYNAMICS_FRONT
+    printf("Steering Angle: %.2f ADC: %u \n", ST_ANGLE, adcST_Angle);
+    #endif
+    #ifdef DYNAMICS_REAR
+    printf("Pressure Brake %.2f bar  ADC: %u \n", BRK_PRESS, adcBRK_PRESS);
+    #endif
+    printf("Susp R: %.2fmm Susp L: %.2fmm\n", SUSP_R, SUSP_L);
+    printf("Speed L: %.2f Speed R: %.2f km/h\n", speed_km_left, speed_km_right);
+}
 
     // Bluetooth messages end
   }
@@ -817,14 +822,14 @@ float MeasureSteeringAngle(uint16_t bits)
 // Constants and variables
   const float ADC_MAX = 4095.0f;
   const float MCU_VREF = 3.3f;                    // MCU reference voltage
-  const float SENSOR_VREF_Max = 4.5f;
-  const float SENSOR_VREF_Min = 0.5f;             // Sensor reference voltage
+  const float SENSOR_VREF_Max = 4.5f;             // Maximum sensor reference voltage
+  const float SENSOR_VREF_Min = 0.5f;             // Minimum sensor reference voltage
   const float Resolution = 180.0f;                // Resolution of sensor -180 to 180
   const float OFFSET = -31.3f;                    // In case of mechanical problems, put offset angle
   
   // Calculate Function Slope
-  float max_v = SENSOR_VREF_Max * (2.0f/3.0f);
-  float min_v = SENSOR_VREF_Min * (2.0f/3.0f);
+  float max_v = SENSOR_VREF_Max * 0.67f;
+  float min_v = SENSOR_VREF_Min * 0.67f;
   float inclination = 360.0f / (max_v - min_v);
   
   // Calculate Steering Angle
@@ -1034,11 +1039,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-void HAL_SYSTICK_CALLBACK()
-{
-  last_captured_pulseL++;                         // Increments 1ms
-  last_captured_pulseR++;                         // Increments 1ms
-}
 void Speed_Measures()
 {
   speed_measures_left[posL] = time_capture_L;
