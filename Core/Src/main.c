@@ -63,12 +63,15 @@ DMA_HandleTypeDef hdma_adc1;
 CAN_HandleTypeDef hcan1;
 CAN_HandleTypeDef hcan2;
 
+IWDG_HandleTypeDef hiwdg;
+
 TIM_HandleTypeDef htim13;
 TIM_HandleTypeDef htim14;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+
 // Global Variables
 uint32_t blink_time = 100, previus_blink = 0;
 uint16_t ADC_VALUE[4];                       // Array for ADC values
@@ -126,6 +129,7 @@ static void MX_CAN2_Init(void);
 static void MX_TIM13_Init(void);
 static void MX_TIM14_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 int _write(int file, char *data, int len)
 {
@@ -175,10 +179,12 @@ int main(void)
   MX_TIM13_Init();
   MX_TIM14_Init();
   MX_USART1_UART_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
-  for (int i = 0; i < MAX_Speed_Measures; i++) {
-    speed_measures_left[i] = 0;
-    speed_measures_right[i] = 0;
+  
+  //Watchdog
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+    Error_Handler();
   }
   HAL_ADC_Start_DMA(&hadc1, ADC_VALUE, 4);    // Start ADC DMA for reading values
   // Start Timer Interruptions for Input Captures
@@ -204,7 +210,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+    //WatchDog
+    HAL_IWDG_Refresh(&hiwdg);
+    
     // LED HEARTBEAT
     int32_t current_time = HAL_GetTick();
     if ((current_time - previus_blink) >= blink_time)
@@ -414,8 +422,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 4;
@@ -601,6 +610,34 @@ static void MX_CAN2_Init(void)
     Error_Handler();
   }
   /* USER CODE END CAN2_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_64;
+  hiwdg.Init.Reload = 1000;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -828,8 +865,8 @@ float MeasureSteeringAngle(uint16_t bits)
   const float OFFSET = -31.3f;                    // In case of mechanical problems, put offset angle
   
   // Calculate Function Slope
-  float max_v = SENSOR_VREF_Max * 0.67f;
-  float min_v = SENSOR_VREF_Min * 0.67f;
+  float max_v = SENSOR_VREF_Max * (2.0f/3.0f);
+  float min_v = SENSOR_VREF_Min * (2.0f/3.0f);
   float inclination = 360.0f / (max_v - min_v);
   
   // Calculate Steering Angle
